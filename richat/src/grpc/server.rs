@@ -29,9 +29,10 @@ use {
             CommitmentLevel as CommitmentLevelProto, GetBlockHeightRequest, GetBlockHeightResponse,
             GetLatestBlockhashRequest, GetLatestBlockhashResponse, GetSlotRequest, GetSlotResponse,
             GetVersionRequest, GetVersionResponse, IsBlockhashValidRequest,
-            IsBlockhashValidResponse, PingRequest, PongResponse, SubscribeReplayInfoRequest,
-            SubscribeReplayInfoResponse, SubscribeRequest, SubscribeUpdate, SubscribeUpdatePing,
-            SubscribeUpdatePong, subscribe_update::UpdateOneof,
+            IsBlockhashValidResponse, PingRequest, PongResponse, SubscribeDeshredRequest,
+            SubscribeReplayInfoRequest, SubscribeReplayInfoResponse, SubscribeRequest,
+            SubscribeUpdate, SubscribeUpdatePing, SubscribeUpdatePong,
+            subscribe_update::UpdateOneof,
         },
         richat::SubscribeAccountsRequest,
     },
@@ -54,12 +55,18 @@ use {
         thread::sleep,
         time::{Duration, SystemTime},
     },
+    tokio::sync::{broadcast, mpsc},
     tokio_util::sync::CancellationToken,
     tonic::{
         Request, Response, Result as TonicResult, Status, Streaming,
         service::interceptor::InterceptorLayer,
     },
     tracing::{error, info, warn},
+};
+
+use crate::grpc::{
+    config::ConfigAppsGrpcDeshred,
+    deshred::{DeshredFilters, DeshredRelay, DeshredStream},
 };
 
 pub mod geyser_gen {
@@ -78,6 +85,7 @@ pub struct GrpcServer {
     ping_interval: Duration,
     subscribe_id: Arc<AtomicU64>,
     subscribe_clients: Arc<SegQueue<SubscribeClient>>,
+    deshred: Option<(Arc<DeshredRelay>, Arc<ConfigAppsGrpcDeshred>)>,
     subscribe_messages_len_max: usize,
     subscribe_messages_replay_len_max: usize,
 }
@@ -114,6 +122,22 @@ impl GrpcServer {
             (None, ready(Ok(())).boxed(), ready(Ok(())).boxed())
         };
 
+        // Deshred aggregation (optional, independent of the replay channel)
+        let deshred_relay = config.deshred.as_ref().and_then(|cfg| {
+            if cfg.endpoints.is_empty() {
+                warn!("deshred is configured without endpoints, SubscribeDeshred stays disabled");
+                return None;
+            }
+            let relay = DeshredRelay::new(cfg.broadcast_capacity);
+            relay.spawn(
+                cfg.endpoints.clone(),
+                cfg.dedup_slots,
+                cfg.reconnect_interval,
+                shutdown.clone(),
+            );
+            Some((Arc::new(relay), Arc::new(cfg.clone())))
+        });
+
         // gRPC service
         let grpc_server = Self {
             shutdown: shutdown.clone(),
@@ -123,6 +147,7 @@ impl GrpcServer {
             ping_interval: config.stream.ping_interval,
             subscribe_id: Arc::new(AtomicU64::new(0)),
             subscribe_clients: Arc::new(SegQueue::new()),
+            deshred: deshred_relay,
             subscribe_messages_len_max: config.stream.messages_len_max,
             subscribe_messages_replay_len_max: config.stream.messages_replay_len_max,
         };
@@ -605,6 +630,7 @@ impl GrpcServer {
 impl geyser_gen::geyser_server::Geyser for GrpcServer {
     type SubscribeStream = ReceiverStream;
     type SubscribeAccountsStream = ReceiverStream;
+    type SubscribeDeshredStream = DeshredStream;
 
     async fn subscribe(
         &self,
@@ -691,6 +717,104 @@ impl geyser_gen::geyser_server::Geyser for GrpcServer {
                 (message.from_slot, new_filter)
             },
         )
+    }
+
+    async fn subscribe_deshred(
+        &self,
+        request: Request<Streaming<SubscribeDeshredRequest>>,
+    ) -> TonicResult<Response<Self::SubscribeDeshredStream>> {
+        let x_subscription_id: Arc<str> = Self::get_x_subscription_id(&request).into();
+        counter!(
+            metrics::GRPC_REQUESTS_TOTAL,
+            "x_subscription_id" => Arc::clone(&x_subscription_id),
+            "method" => "subscribe_deshred"
+        )
+        .increment(1);
+
+        let Some((relay, config)) = self.deshred.clone() else {
+            return Err(Status::unimplemented(
+                "SubscribeDeshred is not enabled on this instance",
+            ));
+        };
+
+        let mut incoming = request.into_inner();
+        let mut updates = relay.subscribe();
+        let (tx, rx) = mpsc::channel(config.client_channel_capacity);
+        let filters_max = config.filters_max;
+
+        let ping_interval = config.ping_interval;
+        let shutdown = self.shutdown.clone();
+
+        tokio::spawn(async move {
+            // No filters until the client sends its first request, which is the
+            // same contract as Subscribe.
+            let mut filters: Option<DeshredFilters> = None;
+            // A client that half-closes its request stream (which is what
+            // `subscribe_deshred_once` does) must keep receiving updates, so
+            // stop polling the request stream rather than ending the response.
+            let mut incoming_open = true;
+            let mut ping = tokio::time::interval(ping_interval);
+            ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ping.tick().await;
+
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => {
+                        let _ = tx.send(Err(Status::internal("shutdown"))).await;
+                        return;
+                    }
+                    message = incoming.message(), if incoming_open => match message {
+                        Ok(Some(request)) => {
+                            // Ping is answered without touching filters, as on
+                            // the main stream; clients send these as keepalives.
+                            if let Some(request_ping) = request.ping {
+                                if tx.send(Ok(DeshredFilters::encode_pong(request_ping.id))).await.is_err() {
+                                    return;
+                                }
+                                continue;
+                            }
+                            match DeshredFilters::new(&request, filters_max) {
+                                Ok(parsed) => filters = Some(parsed),
+                                Err(error) => {
+                                    let _ = tx.send(Err(Status::invalid_argument(error))).await;
+                                    return;
+                                }
+                            }
+                        }
+                        Ok(None) => incoming_open = false,
+                        Err(_error) => return,
+                    },
+                    update = updates.recv() => match update {
+                        Ok(item) => {
+                            let Some(filters) = filters.as_ref() else {
+                                continue;
+                            };
+                            let Some(encoded) = filters.encode(&item) else {
+                                continue;
+                            };
+                            if tx.send(Ok(encoded)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let _ = tx.send(Err(Status::data_loss("lagged"))).await;
+                            return;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    },
+                    _ = ping.tick() => {
+                        // Keeps an idle, narrowly filtered stream alive through
+                        // proxies that would otherwise time it out.
+                        if tx.send(Ok(DeshredFilters::encode_ping())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(DeshredStream::new(rx)))
     }
 
     async fn subscribe_replay_info(

@@ -18,8 +18,8 @@ use {
             CommitmentLevel, GetBlockHeightRequest, GetBlockHeightResponse,
             GetLatestBlockhashRequest, GetLatestBlockhashResponse, GetSlotRequest, GetSlotResponse,
             GetVersionRequest, GetVersionResponse, IsBlockhashValidRequest,
-            IsBlockhashValidResponse, PingRequest, PongResponse, SubscribeReplayInfoRequest,
-            SubscribeReplayInfoResponse, SubscribeRequest,
+            IsBlockhashValidResponse, PingRequest, PongResponse, SubscribeDeshredRequest,
+            SubscribeReplayInfoRequest, SubscribeReplayInfoResponse, SubscribeRequest,
         },
         richat::{GrpcSubscribeRequest, SubscribeAccountsRequest},
     },
@@ -417,6 +417,34 @@ impl<F: Interceptor> GrpcClient<F> {
         request: SubscribeRequest,
     ) -> Result<GrpcClientStream, Status> {
         let (mut tx, rx) = self.subscribe_dragons_mouth().await?;
+        tx.send(request)
+            .await
+            .expect("failed to send to unbounded channel");
+        Ok(rx)
+    }
+
+    // Subscribe Yellowstone gRPC Deshred (pre-execution transactions)
+    pub async fn subscribe_deshred(
+        &mut self,
+    ) -> Result<
+        (
+            mpsc::UnboundedSender<SubscribeDeshredRequest>,
+            GrpcClientStream,
+        ),
+        Status,
+    > {
+        let (subscribe_tx, subscribe_rx) = mpsc::unbounded();
+        let response: Response<Streaming<Vec<u8>>> =
+            self.geyser.subscribe_deshred(subscribe_rx).await?;
+        let stream = GrpcClientStream::new(response.into_inner());
+        Ok((subscribe_tx, stream))
+    }
+
+    pub async fn subscribe_deshred_once(
+        &mut self,
+        request: SubscribeDeshredRequest,
+    ) -> Result<GrpcClientStream, Status> {
+        let (mut tx, rx) = self.subscribe_deshred().await?;
         tx.send(request)
             .await
             .expect("failed to send to unbounded channel");

@@ -14,6 +14,8 @@ The minor version will be incremented upon a breaking change and the patch versi
 
 ### Features
 
+- richat: support `SubscribeDeshred` — aggregate pre-execution deshred transactions from several upstream nodes with first-seen dedup and serve them over the Geyser API ([#214](https://github.com/lamports-dev/richat/issues/214))
+
 ### Breaking
 
 ## 2026-05-20
