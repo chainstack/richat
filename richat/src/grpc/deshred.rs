@@ -19,7 +19,7 @@ use {
     std::{
         collections::{BTreeMap, HashMap, HashSet},
         pin::Pin,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, MutexGuard, PoisonError},
         task::{Context, Poll},
         time::Duration,
     },
@@ -168,6 +168,17 @@ impl Dedup {
             self.slots.remove(&oldest);
         }
     }
+}
+
+/// Takes the dedup lock, recovering from a poisoned mutex.
+///
+/// `Dedup` is always structurally consistent: an insert either happened or it
+/// did not, and the worst a partially applied one can cost is a single
+/// duplicate — which this design already tolerates. Propagating the poison
+/// instead would mean one panicking source task kills every *other* source on
+/// its next lock, stopping all ingest while the process still reports healthy.
+fn lock_dedup(dedup: &Mutex<Dedup>) -> MutexGuard<'_, Dedup> {
+    dedup.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A single client-supplied filter, resolved from the protobuf request.
@@ -461,10 +472,7 @@ impl DeshredRelay {
             let deshred = match update.update_oneof {
                 Some(UpdateOneof::DeshredTransaction(deshred)) => deshred,
                 Some(UpdateOneof::Slot(slot)) => {
-                    let fresh = dedup
-                        .lock()
-                        .expect("deshred dedup mutex poisoned")
-                        .insert_slot_status(slot.slot, slot.status);
+                    let fresh = lock_dedup(dedup).insert_slot_status(slot.slot, slot.status);
                     if fresh {
                         let _ = tx.send(Arc::new(DeshredUpdate::Slot(slot)));
                     }
@@ -476,10 +484,8 @@ impl DeshredRelay {
                 continue;
             };
 
-            let fresh = dedup
-                .lock()
-                .expect("deshred dedup mutex poisoned")
-                .insert_signature(deshred.slot, transaction.signature.as_slice());
+            let fresh =
+                lock_dedup(dedup).insert_signature(deshred.slot, transaction.signature.as_slice());
             if !fresh {
                 continue;
             }
@@ -719,6 +725,32 @@ mod tests {
         )
         .expect("valid filters");
         assert!(txs_only.encode(&slot).is_none());
+    }
+
+    #[test]
+    fn dedup_lock_survives_a_poisoned_mutex() {
+        let dedup = Arc::new(Mutex::new(Dedup::new(4)));
+
+        // Panic while holding the lock, exactly as a source task would.
+        // (The harness captures this thread's panic output unless the test fails.)
+        let poisoner = Arc::clone(&dedup);
+        let joined = std::thread::spawn(move || {
+            let _guard = poisoner.lock().expect("mutex is fresh here");
+            panic!("source task died holding the dedup lock");
+        })
+        .join();
+        assert!(joined.is_err(), "the spawned thread must have panicked");
+        assert!(
+            dedup.lock().is_err(),
+            "precondition: the mutex really is poisoned"
+        );
+
+        // Every other source must keep working rather than dying in turn.
+        assert!(lock_dedup(&dedup).insert_signature(1, &sig(1)));
+        assert!(
+            !lock_dedup(&dedup).insert_signature(1, &sig(1)),
+            "dedup state survived the panic intact"
+        );
     }
 
     #[test]
