@@ -761,7 +761,7 @@ impl geyser_gen::geyser_server::Geyser for GrpcServer {
                 tokio::select! {
                     biased;
                     () = shutdown.cancelled() => {
-                        let _ = tx.send(Err(Status::internal("shutdown"))).await;
+                        let _ = tx.try_send(Err(Status::internal("shutdown")));
                         return;
                     }
                     message = incoming.message(), if incoming_open => match message {
@@ -769,7 +769,10 @@ impl geyser_gen::geyser_server::Geyser for GrpcServer {
                             // Ping is answered without touching filters, as on
                             // the main stream; clients send these as keepalives.
                             if let Some(request_ping) = request.ping {
-                                if tx.send(Ok(DeshredFilters::encode_pong(request_ping.id))).await.is_err() {
+                                if tx
+                                    .try_send(Ok(DeshredFilters::encode_pong(request_ping.id)))
+                                    .is_err()
+                                {
                                     return;
                                 }
                                 continue;
@@ -777,7 +780,7 @@ impl geyser_gen::geyser_server::Geyser for GrpcServer {
                             match DeshredFilters::new(&request, filters_max) {
                                 Ok(parsed) => filters = Some(parsed),
                                 Err(error) => {
-                                    let _ = tx.send(Err(Status::invalid_argument(error))).await;
+                                    let _ = tx.try_send(Err(Status::invalid_argument(error)));
                                     return;
                                 }
                             }
@@ -793,12 +796,23 @@ impl geyser_gen::geyser_server::Geyser for GrpcServer {
                             let Some(encoded) = filters.encode(&item) else {
                                 continue;
                             };
-                            if tx.send(Ok(encoded)).await.is_err() {
-                                return;
+                            // Never await a send here: inside a select! branch
+                            // the other branches stop being polled, so a client
+                            // that stops reading would wedge this task and
+                            // block graceful shutdown. A full queue means the
+                            // subscriber is not draining, which is the same
+                            // condition broadcast lag reports.
+                            match tx.try_send(Ok(encoded)) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    let _ = tx.try_send(Err(Status::data_loss("lagged")));
+                                    return;
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => return,
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            let _ = tx.send(Err(Status::data_loss("lagged"))).await;
+                            let _ = tx.try_send(Err(Status::data_loss("lagged")));
                             return;
                         }
                         Err(broadcast::error::RecvError::Closed) => return,
@@ -806,8 +820,11 @@ impl geyser_gen::geyser_server::Geyser for GrpcServer {
                     _ = ping.tick() => {
                         // Keeps an idle, narrowly filtered stream alive through
                         // proxies that would otherwise time it out.
-                        if tx.send(Ok(DeshredFilters::encode_ping())).await.is_err() {
-                            return;
+                        // A backed-up queue means the client is behind; skip
+                        // the keepalive rather than wait on it.
+                        match tx.try_send(Ok(DeshredFilters::encode_ping())) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => return,
                         }
                     }
                 }

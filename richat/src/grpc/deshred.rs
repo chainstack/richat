@@ -11,7 +11,7 @@ use {
     prost::Message as _,
     richat_client::grpc::ConfigGrpcClient,
     richat_proto::geyser::{
-        SubscribeDeshredRequest, SubscribeRequestFilterDeshredTransactions,
+        SlotStatus, SubscribeDeshredRequest, SubscribeRequestFilterDeshredTransactions,
         SubscribeRequestFilterSlots, SubscribeUpdateDeshred, SubscribeUpdateDeshredTransaction,
         SubscribeUpdateDeshredTransactionInfo, SubscribeUpdatePing, SubscribeUpdatePong,
         SubscribeUpdateSlot, subscribe_update_deshred::UpdateOneof,
@@ -255,11 +255,46 @@ impl DeshredFilter {
     }
 }
 
+/// A client-supplied slot filter.
+///
+/// Mirrors Yellowstone's `FilterSlotsInner`: a slot passes when
+/// `(!filter_by_commitment || commitment == status) && (interslot_updates ||
+/// status is a commitment level)`. Deshred updates carry **no** commitment, so
+/// the first clause can never be satisfied when `filter_by_commitment` is set
+/// -- such a filter legitimately matches nothing.
+#[derive(Debug, Clone, Copy)]
+struct DeshredSlotFilter {
+    filter_by_commitment: bool,
+    interslot_updates: bool,
+}
+
+impl DeshredSlotFilter {
+    const fn new(config: SubscribeRequestFilterSlots) -> Self {
+        Self {
+            filter_by_commitment: matches!(config.filter_by_commitment, Some(true)),
+            interslot_updates: matches!(config.interslot_updates, Some(true)),
+        }
+    }
+
+    fn matches(self, status: i32) -> bool {
+        if self.filter_by_commitment {
+            return false;
+        }
+        self.interslot_updates
+            || matches!(
+                SlotStatus::try_from(status),
+                Ok(SlotStatus::SlotProcessed
+                    | SlotStatus::SlotConfirmed
+                    | SlotStatus::SlotFinalized)
+            )
+    }
+}
+
 /// The set of filters one subscriber asked for.
 #[derive(Debug, Default)]
 pub struct DeshredFilters {
     transactions: HashMap<String, DeshredFilter>,
-    slots: Vec<String>,
+    slots: HashMap<String, DeshredSlotFilter>,
 }
 
 impl DeshredFilters {
@@ -283,7 +318,11 @@ impl DeshredFilters {
 
         Ok(Self {
             transactions,
-            slots: request.slots.keys().cloned().collect(),
+            slots: request
+                .slots
+                .iter()
+                .map(|(name, config)| (name.clone(), DeshredSlotFilter::new(*config)))
+                .collect(),
         })
     }
 
@@ -332,9 +371,15 @@ impl DeshredFilters {
                     }),
                 )
             }
-            // Slot filters carry no criteria that apply before execution, so
-            // every slot filter the client installed matches every update.
-            DeshredUpdate::Slot(slot) => (self.slots.clone(), UpdateOneof::Slot(slot.clone())),
+            DeshredUpdate::Slot(slot) => {
+                let filters = self
+                    .slots
+                    .iter()
+                    .filter(|(_, filter)| filter.matches(slot.status))
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>();
+                (filters, UpdateOneof::Slot(slot.clone()))
+            }
         };
         if filters.is_empty() {
             return None;
@@ -450,9 +495,19 @@ impl DeshredRelay {
             )]
             .into_iter()
             .collect(),
-            slots: [(String::new(), SubscribeRequestFilterSlots::default())]
-                .into_iter()
-                .collect(),
+            // Subscribe to everything the upstream can emit, including the
+            // interslot statuses; per-client slot filters are applied on the
+            // way out. `default()` leaves interslot_updates off, which would
+            // make a client asking for them wait forever. Mirrors source.rs.
+            slots: [(
+                String::new(),
+                SubscribeRequestFilterSlots {
+                    filter_by_commitment: Some(false),
+                    interslot_updates: Some(true),
+                },
+            )]
+            .into_iter()
+            .collect(),
             ping: None,
         };
 
@@ -826,6 +881,71 @@ mod tests {
             Some(upstream),
             "relay must not restamp the node's emission time"
         );
+    }
+
+    fn slots_filter(config: SubscribeRequestFilterSlots) -> DeshredFilters {
+        DeshredFilters::new(
+            &SubscribeDeshredRequest {
+                deshred_transactions: HashMap::new(),
+                slots: [("s".to_owned(), config)].into_iter().collect(),
+                ping: None,
+            },
+            10,
+        )
+        .expect("valid filters")
+    }
+
+    fn slot_update(status: i32) -> DeshredUpdate {
+        DeshredUpdate::Slot(SubscribeUpdateSlot {
+            slot: 42,
+            parent: None,
+            status,
+            dead_error: None,
+        })
+    }
+
+    #[test]
+    fn slot_filter_by_commitment_matches_nothing() {
+        // Deshred updates carry no commitment, so Yellowstone's
+        // `commitment == status` clause can never hold.
+        let filters = slots_filter(SubscribeRequestFilterSlots {
+            filter_by_commitment: Some(true),
+            interslot_updates: Some(true),
+        });
+        for status in 0..=6 {
+            assert!(
+                filters.encode(&slot_update(status)).is_none(),
+                "status {status} must not match a filter_by_commitment filter"
+            );
+        }
+    }
+
+    #[test]
+    fn slot_interslot_updates_gate_non_commitment_statuses() {
+        let without = slots_filter(SubscribeRequestFilterSlots {
+            filter_by_commitment: Some(false),
+            interslot_updates: Some(false),
+        });
+        let with = slots_filter(SubscribeRequestFilterSlots {
+            filter_by_commitment: Some(false),
+            interslot_updates: Some(true),
+        });
+
+        // 0/1/2 are Processed/Confirmed/Finalized; 3..=6 are interslot.
+        for status in 0..=2 {
+            assert!(without.encode(&slot_update(status)).is_some());
+            assert!(with.encode(&slot_update(status)).is_some());
+        }
+        for status in 3..=6 {
+            assert!(
+                without.encode(&slot_update(status)).is_none(),
+                "status {status} needs interslot_updates"
+            );
+            assert!(
+                with.encode(&slot_update(status)).is_some(),
+                "status {status} must pass when interslot_updates is set"
+            );
+        }
     }
 
     #[test]
