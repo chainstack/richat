@@ -340,10 +340,15 @@ impl FilterAccountsState {
             return false;
         }
         for (offset, bytes) in self.memcmp.iter() {
-            if data.len() < *offset + bytes.len() {
+            // `offset + bytes.len()` wrapped to 0 for a hostile offset, passing
+            // this guard and panicking on the slice below.
+            let Some(end) = offset.checked_add(bytes.len()) else {
+                return false;
+            };
+            if data.len() < end {
                 return false;
             }
-            let data = &data[*offset..*offset + bytes.len()];
+            let data = &data[*offset..end];
             if data != bytes.as_slice() {
                 return false;
             }
@@ -447,10 +452,16 @@ impl FilterAccountDataSlices {
     fn new(data_slices: &[ConfigFilterAccountsDataSlice]) -> Self {
         let mut vec = SmallVec::new();
         for data_slice in data_slices {
-            vec.push(Range {
-                start: data_slice.offset as usize,
-                end: (data_slice.offset + data_slice.length) as usize,
-            })
+            // Saturate rather than wrap: `offset + length` overflowing u64 used
+            // to produce `Range { usize::MAX, 0 }`, which `get_slice` then
+            // indexed and panicked on, killing the process for every tenant.
+            // Release builds have no overflow checks, so this must be explicit.
+            let start = usize::try_from(data_slice.offset).unwrap_or(usize::MAX);
+            let end = usize::try_from(data_slice.length)
+                .ok()
+                .and_then(|length| start.checked_add(length))
+                .unwrap_or(usize::MAX);
+            vec.push(Range { start, end })
         }
         Self(vec)
     }
@@ -1192,5 +1203,92 @@ impl<'a> From<MessageRef<'a>> for FilteredUpdateType<'a> {
                 data_slices: FilterAccountDataSlices::empty(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use {
+        super::{FilterAccountDataSlices, FilterAccountsState},
+        crate::config::{
+            ConfigFilterAccountsDataSlice, ConfigFilterAccountsFilter, ConfigLimitsAccounts,
+            ConfigLimitsError,
+        },
+    };
+
+    // Each of these panicked before the fix: `offset + length` wraps in a
+    // release build, and the resulting reversed range was then indexed.
+    // A panic here is not contained -- it unwinds to main and exits the
+    // process, so one tenant's filter took down every other tenant.
+
+    #[test]
+    fn data_slice_offset_overflow_does_not_panic() {
+        let slices = FilterAccountDataSlices::new(&[ConfigFilterAccountsDataSlice {
+            offset: u64::MAX,
+            length: 1,
+        }]);
+        let account = vec![0u8; 128];
+        assert!(
+            slices.get_slice(&account).is_empty(),
+            "an out-of-range slice yields nothing rather than panicking"
+        );
+    }
+
+    #[test]
+    fn data_slice_length_overflow_does_not_panic() {
+        let slices = FilterAccountDataSlices::new(&[ConfigFilterAccountsDataSlice {
+            offset: 1,
+            length: u64::MAX,
+        }]);
+        let account = vec![0u8; 128];
+        assert!(slices.get_slice(&account).is_empty());
+    }
+
+    #[test]
+    fn data_slice_still_works_normally() {
+        let slices = FilterAccountDataSlices::new(&[ConfigFilterAccountsDataSlice {
+            offset: 2,
+            length: 3,
+        }]);
+        let account: Vec<u8> = (0..10).collect();
+        assert_eq!(slices.get_slice(&account).as_ref(), &[2, 3, 4]);
+    }
+
+    #[test]
+    fn memcmp_offset_overflow_does_not_panic() {
+        let state = FilterAccountsState::new(&[ConfigFilterAccountsFilter::Memcmp {
+            offset: usize::MAX,
+            data: vec![0x00],
+        }]);
+        assert!(
+            !state.is_match(0, &[0x00]),
+            "an out-of-range memcmp does not match, and does not panic"
+        );
+    }
+
+    #[test]
+    fn memcmp_still_works_normally() {
+        let state = FilterAccountsState::new(&[ConfigFilterAccountsFilter::Memcmp {
+            offset: 1,
+            data: vec![0x02, 0x03],
+        }]);
+        assert!(state.is_match(0, &[0x01, 0x02, 0x03, 0x04]));
+        assert!(!state.is_match(0, &[0x01, 0x09, 0x09, 0x04]));
+    }
+
+    #[test]
+    fn validation_rejects_an_overflowing_slice() {
+        let limits = ConfigLimitsAccounts::default();
+        let err = limits
+            .check_filter(
+                usize::MAX,
+                &Default::default(),
+                &[ConfigFilterAccountsDataSlice {
+                    offset: u64::MAX,
+                    length: 1,
+                }],
+            )
+            .expect_err("must be rejected before it reaches the matching path");
+        assert!(matches!(err, ConfigLimitsError::DataSliceOverflow));
     }
 }

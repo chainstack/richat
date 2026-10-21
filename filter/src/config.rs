@@ -55,6 +55,8 @@ pub enum ConfigLimitsError {
     DataSliceOutOfOrder,
     #[error("Failed to create filter: data slices overlapped")]
     DataSliceOverlap,
+    #[error("Failed to create filter: data slice offset+length overflows")]
+    DataSliceOverflow,
     #[error("`include_{0}` is not allowed")]
     BlocksNotAllowed(&'static str),
 }
@@ -263,6 +265,14 @@ impl ConfigLimitsAccounts {
 
         ConfigLimits::check_max(data_slices.len(), self.data_slice_max)?;
         for (i, ds_a) in data_slices.iter().enumerate() {
+            // Reject a slice whose end does not fit in u64 before anything
+            // downstream does arithmetic on it. Without this the overlap check
+            // below wraps, and the filter reaches the matching path with a
+            // reversed range.
+            if ds_a.offset.checked_add(ds_a.length).is_none() {
+                return Err(ConfigLimitsError::DataSliceOverflow);
+            }
+
             // check order
             for ds_b in data_slices[i + 1..].iter() {
                 if ds_a.offset > ds_b.offset {
@@ -272,7 +282,7 @@ impl ConfigLimitsAccounts {
 
             // check overlap
             for slice_b in data_slices[0..i].iter() {
-                if ds_a.offset < slice_b.offset + slice_b.length {
+                if ds_a.offset < slice_b.offset.saturating_add(slice_b.length) {
                     return Err(ConfigLimitsError::DataSliceOverlap);
                 }
             }
