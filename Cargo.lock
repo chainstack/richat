@@ -3389,6 +3389,7 @@ dependencies = [
  "agave-reserved-account-keys",
  "anyhow",
  "arrayvec",
+ "bs58",
  "cargo-lock",
  "clap",
  "crossbeam-queue",

@@ -154,6 +154,20 @@ apps:
   #     enabled: true
   #     affinity: null # by default no affinity (taskset syntax)
   #     requests_queue_size: 100
+  #   # Aggregate SubscribeDeshred from upstream nodes and serve it.
+  #   # Omitted or without endpoints, SubscribeDeshred returns UNIMPLEMENTED.
+  #   deshred:
+  #     endpoints:                  # same client options as channel.sources
+  #       - endpoint: http://127.0.0.1:10000
+  #         x_token: null
+  #         tcp_nodelay: true
+  #         tcp_keepalive: 15s
+  #     dedup_slots: 1_024          # slots of first-seen dedup history (~7 min)
+  #     broadcast_capacity: 65_536  # fan-out buffer; overrun drops the subscriber
+  #     client_channel_capacity: 16_384
+  #     filters_max: 10
+  #     reconnect_interval: 1s
+  #     ping_interval: 15s          # server-side keepalive on an idle stream
   #   filter_limits:
   #     name_max: 128
   #     accounts:
