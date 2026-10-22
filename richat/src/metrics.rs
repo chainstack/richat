@@ -62,6 +62,9 @@ pub const GRPC_SUBSCRIBE_TIME_TO_FIRST_MESSAGE_SECONDS: &str =
     "grpc_subscribe_time_to_first_message_seconds"; // x_subscription_id
 pub const GRPC_SUBSCRIBE_HANDSHAKE_ABANDONED_TOTAL: &str =
     "grpc_subscribe_handshake_abandoned_total"; // x_subscription_id, reason
+pub const GRPC_SUBSCRIBE_CLOSED_TOTAL: &str = "grpc_subscribe_closed_total"; // x_subscription_id, stream, reason
+pub const SOURCE_CONNECTED: &str = "source_connected"; // source
+pub const SOURCE_RECONNECTS_TOTAL: &str = "source_reconnects_total"; // source, reason
 pub const PUBSUB_SLOT: &str = "pubsub_slot"; // commitment
 pub const PUBSUB_CACHED_SIGNATURES_TOTAL: &str = "pubsub_cached_signatures_total";
 pub const PUBSUB_STORED_MESSAGES_COUNT_TOTAL: &str = "pubsub_stored_messages_count_total";
@@ -135,6 +138,9 @@ pub fn setup() -> Result<PrometheusHandle, BuildError> {
     describe_histogram!(GRPC_SUBSCRIBE_FILTER_PARSE_SECONDS, "Seconds between subscribe handshake start and the moment the client's SubscribeRequest is parsed into a filter");
     describe_histogram!(GRPC_SUBSCRIBE_TIME_TO_FIRST_MESSAGE_SECONDS, "Seconds between filter being applied and the first data message pushed to the client");
     describe_counter!(GRPC_SUBSCRIBE_HANDSHAKE_ABANDONED_TOTAL, "Subscribe handshakes where the client stream ended before a filter was ever set");
+    describe_counter!(GRPC_SUBSCRIBE_CLOSED_TOTAL, "Subscriptions terminated by the server, by stream and reason; reason=lagged means the client could not keep up and lost data");
+    describe_gauge!(SOURCE_CONNECTED, "1 while the source subscription is established, 0 while disconnected or reconnecting");
+    describe_counter!(SOURCE_RECONNECTS_TOTAL, "Source subscription drops by reason");
     describe_gauge!(PUBSUB_SLOT, "Latest slot handled in PubSub by commitment");
     describe_gauge!(PUBSUB_CACHED_SIGNATURES_TOTAL, "Number of cached signatures");
     describe_gauge!(PUBSUB_STORED_MESSAGES_COUNT_TOTAL, "Number of stored filtered messages in cache");
