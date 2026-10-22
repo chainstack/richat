@@ -383,12 +383,12 @@ impl GrpcServer {
                     }
                     Ok(None) => break,
                     Err(RecvError::Lagged) => {
-                        client.push_error(Status::data_loss("lagged"));
+                        client.push_error("lagged", Status::data_loss("lagged"));
                         errored = true;
                         break;
                     }
                     Err(RecvError::Closed) => {
-                        client.push_error(Status::data_loss("closed"));
+                        client.push_error("closed", Status::data_loss("closed"));
                         errored = true;
                         break;
                     }
@@ -485,7 +485,7 @@ impl GrpcServer {
                     tokio::select! {
                         () = shutdown.cancelled() => {
                             tracing::error!("push error");
-                            client.push_error(Status::internal("shutdown"));
+                            client.push_error("shutdown", Status::internal("shutdown"));
                             break
                         }
                         () = tokio::time::sleep(Duration::from_millis(500)) => {
@@ -583,7 +583,7 @@ impl GrpcServer {
                             }) {
                                 warn!(id, %error, "failed to handle request");
                                 drop(state);
-                                client.push_error(error);
+                                client.push_error("request", error);
                             } else {
                                 // Record filter-parse latency only on the initial
                                 // transition unset -> set. Subsequent filter
@@ -744,8 +744,18 @@ impl geyser_gen::geyser_server::Geyser for GrpcServer {
 
         let ping_interval = config.ping_interval;
         let shutdown = self.shutdown.clone();
+        let x_subscription_id_task = Arc::clone(&x_subscription_id);
 
         tokio::spawn(async move {
+            let closed_inc = |reason: &'static str| {
+                counter!(
+                    metrics::GRPC_SUBSCRIBE_CLOSED_TOTAL,
+                    "x_subscription_id" => Arc::clone(&x_subscription_id_task),
+                    "stream" => "deshred",
+                    "reason" => reason,
+                )
+                .increment(1);
+            };
             // No filters until the client sends its first request, which is the
             // same contract as Subscribe.
             let mut filters: Option<DeshredFilters> = None;
@@ -761,6 +771,7 @@ impl geyser_gen::geyser_server::Geyser for GrpcServer {
                 tokio::select! {
                     biased;
                     () = shutdown.cancelled() => {
+                        closed_inc("shutdown");
                         let _ = tx.try_send(Err(Status::internal("shutdown")));
                         return;
                     }
@@ -780,6 +791,7 @@ impl geyser_gen::geyser_server::Geyser for GrpcServer {
                             match DeshredFilters::new(&request, filters_max) {
                                 Ok(parsed) => filters = Some(parsed),
                                 Err(error) => {
+                                    closed_inc("request");
                                     let _ = tx.try_send(Err(Status::invalid_argument(error)));
                                     return;
                                 }
@@ -805,6 +817,7 @@ impl geyser_gen::geyser_server::Geyser for GrpcServer {
                             match tx.try_send(Ok(encoded)) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
+                                    closed_inc("lagged");
                                     let _ = tx.try_send(Err(Status::data_loss("lagged")));
                                     return;
                                 }
@@ -812,6 +825,7 @@ impl geyser_gen::geyser_server::Geyser for GrpcServer {
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
+                            closed_inc("lagged");
                             let _ = tx.try_send(Err(Status::data_loss("lagged")));
                             return;
                         }
@@ -1000,7 +1014,14 @@ impl SubscribeClient {
         self.messages.push(Ok((message, data)));
     }
 
-    pub fn push_error(&self, error: Status) {
+    pub fn push_error(&self, reason: &'static str, error: Status) {
+        counter!(
+            metrics::GRPC_SUBSCRIBE_CLOSED_TOTAL,
+            "x_subscription_id" => Arc::clone(&self.x_subscription_id),
+            "stream" => "subscribe",
+            "reason" => reason,
+        )
+        .increment(1);
         while self.messages.pop().is_some() {}
         self.messages.push(Err(error));
         self.waker.wake();
@@ -1234,4 +1255,73 @@ impl MessagesCache {
 struct MessagesCacheItem {
     pos: u64,
     msg: Option<ParsedMessage>,
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, metrics_exporter_prometheus::PrometheusBuilder};
+
+    fn render_after(f: impl FnOnce()) -> String {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, f);
+        handle.render()
+    }
+
+    fn client() -> SubscribeClient {
+        SubscribeClient::new(1, 1024, 1024, Arc::from("test-sub"))
+    }
+
+    #[test]
+    fn push_error_records_reason_and_stream() {
+        let rendered = render_after(|| {
+            client().push_error("lagged", Status::data_loss("lagged"));
+        });
+
+        assert!(
+            rendered.contains("grpc_subscribe_closed_total"),
+            "counter missing from render:\n{rendered}"
+        );
+        assert!(rendered.contains(r#"reason="lagged""#), "{rendered}");
+        assert!(rendered.contains(r#"stream="subscribe""#), "{rendered}");
+        assert!(
+            rendered.contains(r#"x_subscription_id="test-sub""#),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn each_termination_reason_is_counted_separately() {
+        // A single label value for every drop would make "customer could not
+        // keep up" indistinguishable from "we shut the server down".
+        let rendered = render_after(|| {
+            let c = client();
+            c.push_error("lagged", Status::data_loss("lagged"));
+            c.push_error("shutdown", Status::internal("shutdown"));
+            c.push_error("storage_read", Status::internal("x"));
+        });
+
+        for reason in ["lagged", "shutdown", "storage_read"] {
+            assert!(
+                rendered.contains(&format!(r#"reason="{reason}""#)),
+                "reason {reason} missing:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_lag_increments_rather_than_resets() {
+        let rendered = render_after(|| {
+            let c = client();
+            for _ in 0..3 {
+                c.push_error("lagged", Status::data_loss("lagged"));
+            }
+        });
+
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with("grpc_subscribe_closed_total") && l.contains("lagged"))
+            .unwrap_or_else(|| panic!("no lagged line:\n{rendered}"));
+        assert!(line.ends_with(" 3"), "expected count 3, got: {line}");
+    }
 }

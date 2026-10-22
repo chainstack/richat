@@ -1,4 +1,5 @@
 use {
+    crate::metrics,
     crate::{
         channel::GlobalReplayFromSlot,
         config::{
@@ -6,6 +7,7 @@ use {
             ConfigGrpcClientSource,
         },
     },
+    ::metrics::{counter, gauge},
     anyhow::Context as _,
     futures::{
         future::try_join_all,
@@ -39,6 +41,13 @@ use {
     tonic::Code,
     tracing::{error, info, warn},
 };
+
+/// Mark a source as down and record why. Paired with `SOURCE_CONNECTED` being
+/// set back to 1 once the subscription is re-established.
+fn source_disconnected(name: &'static str, reason: &'static str) {
+    gauge!(metrics::SOURCE_CONNECTED, "source" => name).set(0);
+    counter!(metrics::SOURCE_RECONNECTS_TOTAL, "source" => name, "reason" => reason).increment(1);
+}
 
 #[derive(Debug, Error)]
 enum ConnectError {
@@ -214,12 +223,15 @@ impl Subscription {
                                         return Err(ReceiveError::ReplayFailed);
                                     }
                                     error!(name, "failed to replay, waiting for other sources");
+                                    source_disconnected(name, "replay");
                                 }
                                 Ok(Err(error)) => {
-                                    error!(name, ?error, "failed to receive")
+                                    error!(name, ?error, "failed to receive");
+                                    source_disconnected(name, "receive");
                                 }
                                 Err(_) => {
-                                    error!(name, "stream is finished")
+                                    error!(name, "stream is finished");
+                                    source_disconnected(name, "finished");
                                 }
                             }
                             state.4 = None;
@@ -238,6 +250,7 @@ impl Subscription {
                                 Ok(stream) => {
                                     state.4 = Some(stream);
                                     state.0.reset();
+                                    gauge!(metrics::SOURCE_CONNECTED, "source" => name).set(1);
                                 }
                                 Err(error) => {
                                     if error.is_replay_slot_not_available() {
@@ -245,8 +258,10 @@ impl Subscription {
                                             return Err(ReceiveError::ReplayFailed);
                                         }
                                         error!(name, "failed to replay at subscribe time, waiting for other sources");
+                                        source_disconnected(name, "replay");
                                     } else {
                                         error!(name, ?error, "failed to connect");
+                                        source_disconnected(name, "connect");
                                     }
                                     state.0.sleep().await;
                                 }

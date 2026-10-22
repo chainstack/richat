@@ -128,7 +128,7 @@ impl Storage {
 
             if let Some(error) = req.state.read_error.take() {
                 drop(locked_state);
-                req.client.push_error(error);
+                req.client.push_error("storage_read", error);
                 ReplayQueue::drop_req(&storage.replay_queue);
                 continue;
             }

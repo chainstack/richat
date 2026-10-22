@@ -15,6 +15,7 @@ The minor version will be incremented upon a breaking change and the patch versi
 ### Features
 
 - richat: support `SubscribeDeshred` — aggregate pre-execution deshred transactions from several upstream nodes with first-seen dedup and serve them over the Geyser API ([#214](https://github.com/lamports-dev/richat/issues/214))
+- richat: add `grpc_subscribe_closed_total` (server-side subscription terminations by stream and reason), `source_connected` and `source_reconnects_total` — slow-consumer evictions and source drops were previously invisible to monitoring
 
 ### Breaking
 
